@@ -10,7 +10,7 @@ app = FastAPI(
 )
 
 client = Groq(
-    api_key=os.environ.get("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"), 
+    api_key=os.environ.get("GROQ_API_KEY"), 
 )
 
 class CopyRequest(BaseModel):
