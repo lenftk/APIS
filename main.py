@@ -1,70 +1,145 @@
 import os
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
+import logging
+import asyncio
+import time
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, validator, Field
 from groq import Groq
+from dotenv import load_dotenv
+
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_random_exponential, 
+    retry_if_exception_type,
+    before_sleep_log
+)
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("Viral-Marketing-AI")
 
 app = FastAPI(
-    title="Marketing Copy Generator AI",
-    description="Llama3 기반의 초고속 마케팅 카피라이팅 생성 API",
-    version="1.0.0"
+    title="Viral Marketing Copywriting AI",
+    description="Render Spotlight V4: Resilience & Fallback Architecture",
+    version="4.0.0"
 )
 
-client = Groq(
-    api_key=os.environ.get("GROQ_API_KEY"), 
-)
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+MAX_CONCURRENT_REQUESTS = 5
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 class CopyRequest(BaseModel):
-    product_name: str       
-    target_audience: str    
-    tone: str = "witty"     
-    platform: str = "instagram" 
+    product_name: str = Field(..., description="제품 이름")
+    target_audience: str = Field(..., description="타겟 고객")
+    tone: str = "witty"
+    platform: str = "instagram"
+
+    @validator('product_name', 'target_audience')
+    def restrict_length(cls, v):
+        max_len = 100
+        if len(v) > max_len:
+            logger.warning(f"Input truncated: {v} -> {v[:max_len]}")
+            return v[:max_len] 
+        return v
 
 class CopyResponse(BaseModel):
     generated_copy: str
     hashtags: str
+    model_used: str  
+    token_usage: dict 
 
 def create_prompt(req: CopyRequest):
     return f"""
-    당신은 한국 최고의 바이럴 마케팅 전문 카피라이터입니다.
-    다음 제품에 대한 매력적인 {req.platform}용 홍보 문구를 작성해주세요.
+    Act as a professional Korean marketing copywriter.
     
-    - 제품명: {req.product_name}
-    - 타겟 고객: {req.target_audience}
-    - 톤앤매너: {req.tone}
+    [Input Info]
+    Product: {req.product_name}
+    Target: {req.target_audience}
+    Tone: {req.tone}
+    Platform: {req.platform}
     
-    [조건]
-    1. {req.platform} 플랫폼의 특성에 맞게 이모지를 적절히 사용하세요.
-    2. 고객의 페인포인트(Pain Point)를 건드리고 해결책을 제시하세요.
-    3. 문장은 가독성 있게 줄바꿈을 하세요.
-    4. 한국어로 작성하세요.
+    [Instructions]
+    1. Write a viral marketing post in Korean (Hangul).
+    2. Keep it concise and engaging.
+    3. Include 5-7 trending hashtags at the end.
+    
+    [Constraints] 🚨 VERY IMPORTANT
+    1. NO Hanja (Chinese characters). Use Korean Hangul only. (e.g., 使用 (X) -> 사용 (O))
+    2. NO emojis inside the middle of a sentence. (e.g., "정말 🔥 핫한" (X) -> "정말 핫한 🔥" (O))
+    3. Use emojis ONLY at the end of sentences or for bullet points to keep the text clean.
     """
 
-@app.post("/generate", response_model=CopyResponse)
-async def generate_copy(request: CopyRequest, x_rapidapi_proxy_secret: str = Header(None)):
-
-    try:
-        completion = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": create_prompt(request),
-                }
-            ],
-            model="llama-3.3-70b-versatile",
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_random_exponential(multiplier=1, max=10),
+    retry=retry_if_exception_type(Exception),
+    before_sleep=before_sleep_log(logger, logging.WARNING)
+)
+async def call_groq_with_retry(prompt: str, model: str):
+    loop = asyncio.get_event_loop()
+    completion = await loop.run_in_executor(
+        None,
+        lambda: client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
             temperature=0.7,
-            max_tokens=500,
+            max_tokens=800,
         )
+    )
+    return completion
+
+@app.post("/generate", response_model=CopyResponse)
+async def generate_copy(request: CopyRequest):
+    async with semaphore:
+        prompt = create_prompt(request)
+        logger.info(f"{request.product_name} (Queue)")
         
+        try:
+            used_model = "llama-3.3-70b-versatile"
+            completion = await call_groq_with_retry(prompt, used_model)
+        
+        except Exception as e:
+            logger.error(f"error: {e}. Fallback")
+            try:
+                used_model = "llama-3.1-8b-instant"
+                completion = await call_groq_with_retry(prompt, used_model)
+            except Exception as final_e:
+                logger.error(f"error: {final_e}")
+                raise HTTPException(status_code=503, detail="AI Service Busy. Please try again.")
+
         full_text = completion.choices[0].message.content
         
+        usage = completion.usage
+        logger.info(f"generated ({used_model}) | Input: {usage.prompt_tokens}, Output: {usage.completion_tokens}")
+
+        if "#" in full_text:
+            main_text, tags = full_text.rsplit("#", 1)
+            tags = "#" + tags
+        else:
+            main_text = full_text
+            tags = "#추천 #트렌드"
+
         return {
-            "generated_copy": full_text,
-            "hashtags": "#추천 #필수템 #트렌드" 
+            "generated_copy": main_text.strip(),
+            "hashtags": tags.strip(),
+            "model_used": used_model,
+            "token_usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens
+            }
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/")
+def read_root():
+    return {
+        "status": "online",
+        "version": "2.0.0", 
+        "architecture": "Resilient (Semaphore + Fallback + Backoff)"
+    }
