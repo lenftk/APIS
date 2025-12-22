@@ -26,8 +26,8 @@ logger = logging.getLogger("Viral-Marketing-AI")
 
 app = FastAPI(
     title="Viral Marketing Copywriting AI",
-    description="Render Spotlight V4: Resilience & Fallback Architecture",
-    version="4.0.0"
+    description="Render Spotlight V2",
+    version="2.0.0"
 )
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
