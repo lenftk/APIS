@@ -72,8 +72,9 @@ def create_prompt(req: CopyRequest):
     
     [Constraints] 🚨 VERY IMPORTANT
     1. NO Hanja (Chinese characters). Use Korean Hangul only. (e.g., 使用 (X) -> 사용 (O))
-    2. NO emojis inside the middle of a sentence. (e.g., "정말 🔥 핫한" (X) -> "정말 핫한 🔥" (O))
-    3. Use emojis ONLY at the end of sentences or for bullet points to keep the text clean.
+    2. 이상한 문자 금지(ประเทศไทย, 日本語, 助け 등) - 한국어만 사용
+    3. NO emojis inside the middle of a sentence. (e.g., "정말 🔥 핫한" (X) -> "정말 핫한 🔥" (O))
+    4. Use emojis ONLY at the end of sentences or for bullet points to keep the text clean.
     """
 
 @retry(
@@ -89,7 +90,7 @@ async def call_groq_with_retry(prompt: str, model: str):
         lambda: client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=model,
-            temperature=0.7,
+            temperature=0.5,
             max_tokens=800,
         )
     )
